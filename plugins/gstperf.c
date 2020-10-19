@@ -1,5 +1,9 @@
-/* GStreamer
+/*
  * Copyright (C) 2019 RidgeRun, LLC (http://www.ridgerun.com)
+ * Portions Copyright (C) 2020 D3 Engineering, LLC (http://www.d3engineering.com)
+ * Portions from fpsdisplaysink,
+ * Copyright 2009 Nokia Corporation <multimedia@maemo.org>
+ * Copyright 2006 Zeeshan Ali <zeeshan.ali@nokia.com>.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -99,6 +103,10 @@ struct _GstPerf
   guint32 prev_cpu_total;
   guint32 prev_cpu_idle;
 
+  /* Support for watching for QoS bus messages */
+  GstBus *bus;
+  gulong bus_handler_id;
+
   /* Properties */
   gboolean print_arm_load;
 };
@@ -120,6 +128,8 @@ G_DEFINE_TYPE (GstPerf, gst_perf, GST_TYPE_BASE_TRANSFORM);
 #define GST_PERF_MS_PER_S 1000.0
 
 /* prototypes */
+static void gst_perf_dispose (GObject *gobject);
+static void gst_perf_set_bus(GstPerf *perf, gboolean acquire);
 static void gst_perf_set_property (GObject * object, guint property_id,
     const GValue * value, GParamSpec * pspec);
 static void gst_perf_get_property (GObject * object, guint property_id,
@@ -150,6 +160,7 @@ gst_perf_class_init (GstPerfClass * klass)
   GstBaseTransformClass *base_transform_class =
       GST_BASE_TRANSFORM_CLASS (klass);
 
+  gobject_class->dispose = GST_DEBUG_FUNCPTR(gst_perf_dispose);
   gobject_class->set_property = gst_perf_set_property;
   gobject_class->get_property = gst_perf_get_property;
 
@@ -194,6 +205,9 @@ gst_perf_init (GstPerf * perf)
 {
   gst_perf_clear (perf);
 
+  perf->bus = NULL;
+  perf->bus_handler_id = 0;
+
   perf->print_arm_load = DEFAULT_PRINT_ARM_LOAD;
   perf->bps_window_size = DEFAULT_BITRATE_WINDOW_SIZE;
   perf->bps_interval = DEFAULT_BITRATE_INTERVAL;
@@ -206,6 +220,13 @@ gst_perf_init (GstPerf * perf)
 
   gst_base_transform_set_gap_aware (GST_BASE_TRANSFORM_CAST (perf), TRUE);
   gst_base_transform_set_passthrough (GST_BASE_TRANSFORM_CAST (perf), TRUE);
+}
+
+static void gst_perf_dispose (GObject *gobject)
+{
+  GstPerf *perf = GST_PERF (gobject);
+  gst_perf_set_bus(perf, FALSE);
+  G_OBJECT_CLASS (gst_perf_parent_class)->dispose (gobject);
 }
 
 void
@@ -332,6 +353,9 @@ gst_perf_start (GstBaseTransform * trans)
 
   perf->error = g_error_new (GST_CORE_ERROR,
       GST_CORE_ERROR_TAG, "Performance Information");
+
+  gst_perf_set_bus(perf, TRUE);
+
   return TRUE;
 }
 
@@ -349,7 +373,97 @@ gst_perf_stop (GstBaseTransform * trans)
   if (perf->error)
     g_error_free (perf->error);
 
+  gst_perf_set_bus(perf, FALSE);
+
   return TRUE;
+}
+
+/**
+ * gst_perf_handle_message:
+ * @bus: the source of the message
+ * @msg: the message
+ * @perf: the instance
+ *
+ * Handle a message from the bus
+ */
+static void
+gst_perf_handle_message(G_GNUC_UNUSED GstBus *bus, GstMessage *msg,
+    GstPerf *perf)
+{
+  GST_LOG_OBJECT(perf, "Got message %" GST_PTR_FORMAT, msg);
+
+  if (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_QOS) {
+    GstFormat format;
+    guint64 rendered, dropped;
+
+    gst_message_parse_qos_stats (msg, &format, &rendered, &dropped);
+    if (format != GST_FORMAT_UNDEFINED) {
+      if (dropped != -1)
+        GST_WARNING_OBJECT(perf, "Dropped %" G_GUINT64_FORMAT " frames",
+            dropped);
+    }
+  }
+}
+
+/**
+ * gst_perf_unref_instance:
+ * @data: the instance
+ * @closure: not used
+ *
+ * Used by gst_perf_set_bus().
+ */
+static void
+gst_perf_unref_instance (gpointer data, G_GNUC_UNUSED GClosure *closure)
+{
+  GstPerf *perf = (GstPerf *)data;
+  gst_object_unref(GST_OBJECT(perf));
+}
+
+/**
+ * gst_perf_set_bus:
+ * @perf: the instance
+ * @acquire: TRUE to get the bus; FALSE to free the bus.
+ *
+ * Set perf->bus, freeing any existing bus.
+ */
+static void
+gst_perf_set_bus(GstPerf *perf, gboolean acquire)
+{
+  if(perf->bus != NULL && perf->bus_handler_id != 0) {
+      g_signal_handler_disconnect(perf->bus, perf->bus_handler_id);
+      perf->bus_handler_id = 0;
+  }
+
+  if(perf->bus != NULL) {
+    gst_bus_disable_sync_message_emission(perf->bus);
+    gst_object_unref(GST_OBJECT(perf->bus));
+    perf->bus = NULL;
+  }
+
+  if(acquire) {
+
+    // Get the pipeline's bus, not our personal bus.
+    perf->bus = gst_element_get_bus(GST_ELEMENT_PARENT(GST_ELEMENT_CAST(perf)));
+
+    GST_DEBUG_OBJECT(perf, "Got bus %" GST_PTR_FORMAT, perf->bus);
+    gst_bus_enable_sync_message_emission(perf->bus);
+
+    perf->bus_handler_id = g_signal_connect_data(perf->bus,
+        "sync-message",
+        G_CALLBACK(GST_DEBUG_FUNCPTR(gst_perf_handle_message)),
+        perf,
+        GST_DEBUG_FUNCPTR(gst_perf_unref_instance),
+        0
+    );
+
+    /* make the ref that gst_perf_unref_instance will remove */
+    if(perf->bus_handler_id != 0) {
+      gst_object_ref(GST_OBJECT(perf));
+      GST_DEBUG_OBJECT(perf, "Got bus handler");
+    } else {
+      GST_WARNING_OBJECT(perf, "Could not get bus handler");
+    }
+  }
 }
 
 static gboolean
@@ -535,7 +649,7 @@ static gboolean
 plugin_init (GstPlugin * plugin)
 {
 
-  GST_DEBUG_CATEGORY_INIT (gst_perf_debug, "perf", 0,
+  GST_DEBUG_CATEGORY_INIT (gst_perf_debug, "perf", GST_DEBUG_FG_BLUE|GST_DEBUG_BOLD,
       "Debug category for perf element");
 
   return gst_element_register (plugin, "perf", GST_RANK_NONE, GST_TYPE_PERF);
