@@ -410,13 +410,31 @@ gst_perf_handle_message(G_GNUC_UNUSED GstBus *bus, GstMessage *msg,
  * @data: the instance
  * @closure: not used
  *
- * Used by gst_perf_set_bus().
+ * Unref @data.  Used by gst_perf_set_bus().
  */
 static void
 gst_perf_unref_instance (gpointer data, G_GNUC_UNUSED GClosure *closure)
 {
-  GstPerf *perf = (GstPerf *)data;
-  gst_object_unref(GST_OBJECT(perf));
+  gst_object_unref(GST_OBJECT(data));
+}
+
+/**
+ * gst_perf_get_toplevel_bus:
+ * @perf: the instance
+ *
+ * Returns: (transfer full) (nullable): a pointer to the bus
+ */
+GstBus *gst_perf_get_toplevel_bus(GstPerf *perf)
+{
+  GstElement *el1, *el2;
+
+  /* walk up to the top level */
+  el1 = el2 = GST_ELEMENT_CAST(perf);
+  while(el1) {
+    el2 = el1;
+    el1 = GST_ELEMENT_PARENT(el1);
+  }
+  return gst_element_get_bus(el2);
 }
 
 /**
@@ -443,7 +461,7 @@ gst_perf_set_bus(GstPerf *perf, gboolean acquire)
   if(acquire) {
 
     // Get the pipeline's bus, not our personal bus.
-    perf->bus = gst_element_get_bus(GST_ELEMENT_PARENT(GST_ELEMENT_CAST(perf)));
+    perf->bus = gst_perf_get_toplevel_bus(perf);
 
     GST_DEBUG_OBJECT(perf, "Got bus %" GST_PTR_FORMAT, perf->bus);
     gst_bus_enable_sync_message_emission(perf->bus);
@@ -456,8 +474,8 @@ gst_perf_set_bus(GstPerf *perf, gboolean acquire)
         0
     );
 
-    /* make the ref that gst_perf_unref_instance will remove */
     if(perf->bus_handler_id != 0) {
+      /* make the ref that gst_perf_unref_instance() will remove */
       gst_object_ref(GST_OBJECT(perf));
       GST_DEBUG_OBJECT(perf, "Got bus handler");
     } else {
